@@ -1,8 +1,9 @@
 # learn-kafka
 
 A Python project for learning Apache Kafka hands-on through a simulated FIX protocol
-trading system. It runs a single-node Kafka broker in Docker and demonstrates core
-Kafka concepts through a working producer and two partition-assigned consumers.
+trading system. It runs a single-node Kafka broker, Elasticsearch, and Kibana in Docker
+and demonstrates core Kafka concepts through a working producer, two partition-assigned
+consumers, and an Elasticsearch sink.
 
 ---
 
@@ -16,8 +17,10 @@ Kafka concepts through a working producer and two partition-assigned consumers.
 | Delivery acknowledgement | Delivery callback fires when the broker acks each message |
 | `flush()` | Blocks until all in-flight messages are confirmed |
 | Manual partition assignment | `assign()` + `TopicPartition` pins each consumer to fixed partitions |
-| Consumer groups and offset tracking | Both consumers share `group.id = learn-group` |
+| Consumer groups and offset tracking | `learn-group` (consumers) and `es-sink-group` (ES sink) are independent |
 | `auto.offset.reset=earliest` | Consumers always start from the beginning on first run |
+| Fan-out | `es_sink.py` uses a separate group — same messages delivered to both groups |
+| Elasticsearch sink | Every FIX message is indexed into ES; Kibana provides a visual UI |
 
 ---
 
@@ -25,10 +28,11 @@ Kafka concepts through a working producer and two partition-assigned consumers.
 
 ```
 learn-kafka/
-├── docker-compose.yml   # Single-node KRaft Kafka broker (apache/kafka:4.1.2)
-├── requirements.txt     # confluent-kafka==2.14.0
-├── producer.py          # Sends 9 FIX messages (8 New Order Single + 1 Cancel) across 3 partitions
-├── consumer.py          # Reads from assigned partitions (--id 0 or --id 1)
+├── docker-compose.yml   # Kafka broker + Elasticsearch + Kibana
+├── requirements.txt     # confluent-kafka==2.14.0, elasticsearch==8.19.3
+├── producer.py          # Sends 9 FIX messages (8 New Order Single + 1 Cancel)
+├── consumer.py          # Partition-assigned consumer (--id 0 or --id 1)
+├── es_sink.py           # Kafka consumer that indexes every message into Elasticsearch
 ├── README.md            # This file
 ├── PROJECT_STATE.md     # Detailed technical reference for all files
 └── .gitignore
@@ -40,12 +44,19 @@ learn-kafka/
 
 ```
 producer.py
-  AAPL orders  ──► partition 0 ──► consumer 0  (--id 0)
-  MSFT orders  ──► partition 1 ──► consumer 0  (--id 0)
-  GOOGL orders ──► partition 2 ──► consumer 1  (--id 1)
+  AAPL orders  ──► partition 0 ──► consumer.py --id 0  (learn-group)
+  MSFT orders  ──► partition 1 ──► consumer.py --id 0  (learn-group)
+  GOOGL orders ──► partition 2 ──► consumer.py --id 1  (learn-group)
                         │
-                  Kafka broker
-                 (Docker, port 9092)
+                        ├──► es_sink.py  (es-sink-group)
+                        │         │
+                        │         ▼
+                        │    Elasticsearch :9200
+                        │         │
+                        │         ▼
+                        │      Kibana :5601
+                        │
+                  Kafka broker (Docker, port 9092)
                topic: fix-orders, 3 partitions
 ```
 
@@ -77,14 +88,14 @@ Messages are JSON-encoded FIX 4.4 dicts using standard numeric tag keys:
 | 35 | MsgType | `D` = New Order Single, `F` = Order Cancel Request |
 | 49 | SenderCompID | TRADER1 |
 | 56 | TargetCompID | EXCHANGE |
-| 11 | ClOrdID | unique 8-char order ID |
+| 11 | ClOrdID | unique 8-char order ID (used as Elasticsearch document ID) |
 | 41 | OrigClOrdID | original order ID (cancel messages only) |
 | 55 | Symbol | AAPL / MSFT / GOOGL |
 | 54 | Side | `1` = Buy, `2` = Sell |
 | 38 | OrderQty | shares |
 | 44 | Price | limit price (absent on market orders) |
 | 40 | OrdType | `1` = Market, `2` = Limit |
-| 60 | TransactTime | ISO 8601 timestamp stamped at send time |
+| 60 | TransactTime | ISO 8601 timestamp stamped at send time (Kibana timestamp field) |
 
 ---
 
@@ -104,29 +115,31 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
 
-**2. Install the Kafka client**
+**2. Install dependencies**
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-**3. Start the Kafka broker**
+**3. Start all services**
 
 ```powershell
 docker compose up -d
 ```
 
-Wait about 10 seconds for the broker to be ready. You can verify with:
+Wait about 20–30 seconds for Elasticsearch and Kibana to be ready (Kafka is faster at ~10s).
+You can check status with:
 
 ```powershell
-docker compose logs broker
+docker compose logs elasticsearch
+docker compose logs kibana
 ```
 
 ---
 
 ## Running the demo
 
-Open three terminals, all with the virtual environment activated.
+Open four terminals, all with the virtual environment activated.
 
 **Terminal A — Consumer 0** (reads partitions 0 and 1 — AAPL + MSFT orders)
 
@@ -140,54 +153,52 @@ python consumer.py --id 0
 python consumer.py --id 1
 ```
 
-**Terminal C — Producer** (sends 9 FIX messages across all 3 partitions)
+**Terminal C — Elasticsearch sink** (reads all partitions, indexes every message into ES)
+
+```powershell
+python es_sink.py
+```
+
+**Terminal D — Producer** (sends 9 FIX messages across all 3 partitions)
 
 ```powershell
 python producer.py
 ```
 
-### Expected output
+### Expected output — ES sink
 
-Producer:
 ```
-Sending 9 FIX messages to 'fix-orders' ...
+Waiting for Elasticsearch at http://localhost:9200 ...
+Elasticsearch is ready.
 
-  Partition 0 → AAPL  (consumer 0)
-  Partition 1 → MSFT  (consumer 0)
-  Partition 2 → GOOGL (consumer 1)
+Subscribed to 'fix-orders' as group 'es-sink-group'.
+Indexing into Elasticsearch index 'fix-orders' ...
 
-  [OK]  partition=0  offset=0  key=AAPL
-  [OK]  partition=1  offset=0  key=MSFT
-  [OK]  partition=0  offset=1  key=AAPL
-  [OK]  partition=2  offset=0  key=GOOGL
-  [OK]  partition=0  offset=2  key=AAPL
-  [OK]  partition=1  offset=1  key=MSFT
-  [OK]  partition=2  offset=1  key=GOOGL
-  [OK]  partition=0  offset=3  key=AAPL
-  [OK]  partition=1  offset=2  key=MSFT
-
-All messages delivered successfully.
+  [INDEXED]  ORDER  symbol=AAPL  id=A3F2B1C0  partition=0  offset=0  result=created
+  [INDEXED]  ORDER  symbol=MSFT  id=D7E4C2A1  partition=1  offset=0  result=created
+  [INDEXED]  ORDER  symbol=AAPL  id=F1B9E3D2  partition=0  offset=1  result=created
+  [INDEXED]  ORDER  symbol=GOOGL id=C5A8F4B3  partition=2  offset=0  result=created
+  [INDEXED]  CANCEL symbol=AAPL  id=E2D6C7A4  partition=0  offset=2  result=created
+  ...
 ```
 
-Consumer 0 (receives AAPL and MSFT — partitions 0 and 1):
-```
-[consumer-0] assigned to 'fix-orders' partitions [0, 1]. Waiting for messages ...
+---
 
-[consumer-0]  partition=0  offset=0  key=AAPL
-  payload: { "8": "FIX.4.4", "35": "D", "55": "AAPL", "54": "1", "38": 100, ... }
+## Viewing orders in Kibana
 
-[consumer-0]  partition=1  offset=0  key=MSFT
-  payload: { "8": "FIX.4.4", "35": "D", "55": "MSFT", "54": "2", "38": 200, ... }
-...
-```
+1. Open **http://localhost:5601**
+2. Dismiss the security warning (expected — security is disabled for local dev)
+3. Click **Explore on my own**
+4. Hamburger menu → **Discover** → **Create data view**
+5. Index pattern: `fix-orders`, Name: `fix-orders`, Timestamp: `60`
+6. Click **Save data view to Kibana**
 
-Consumer 1 (receives GOOGL — partition 2 only):
-```
-[consumer-1] assigned to 'fix-orders' partitions [2]. Waiting for messages ...
+All 9 indexed FIX orders appear in the Discover view. You can filter by field (e.g. `55: AAPL` to see only Apple orders) or use the search bar.
 
-[consumer-1]  partition=2  offset=0  key=GOOGL
-  payload: { "8": "FIX.4.4", "35": "D", "55": "GOOGL", "54": "1", "38": 75, ... }
-...
+Query directly via the REST API:
+
+```powershell
+curl http://localhost:9200/fix-orders/_search?pretty
 ```
 
 ---
@@ -211,7 +222,7 @@ Consumer 1 (receives GOOGL — partition 2 only):
 ## Things to try next
 
 **Re-read all messages from offset 0**
-Change `GROUP_ID` in `consumer.py` to a new string (e.g. `learn-group-2`) and restart.
+Change `GROUP_ID` in `consumer.py` or `es_sink.py` to a new string and restart.
 Kafka keeps messages until the retention period expires, so old messages are always
 available to a new consumer group.
 
@@ -222,13 +233,24 @@ per symbol — the same guarantee a real trading system relies on.
 
 **Fan-out (pub/sub)**
 Run two instances of `consumer.py --id 0` with *different* `GROUP_ID` values.
-Both will receive every AAPL and MSFT message independently — same as two separate
-downstream systems consuming the same order flow.
+Both receive every AAPL and MSFT message independently — same as two separate
+downstream systems consuming the same order flow. `es_sink.py` already demonstrates
+this pattern with `es-sink-group`.
 
 **Automatic rebalancing**
 Change `assign()` to `subscribe([TOPIC])` in `consumer.py` and start two instances
 with the same `group.id`. Kafka will automatically split the 3 partitions between
 them and rebalance when either consumer stops.
+
+**Persist Elasticsearch data across restarts**
+Add a named volume to the `elasticsearch` service in `docker-compose.yml` so indexed
+orders survive `docker compose down`:
+```yaml
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+volumes:
+  esdata:
+```
 
 **Add Execution Reports**
 Extend `producer.py` with an `exec_report()` helper using MsgType=8 and tags
@@ -240,9 +262,10 @@ simulate the exchange acknowledging or filling an order.
 ## Stopping everything
 
 ```powershell
-# Stop consumers with Ctrl+C in each terminal, then:
+# Stop all Python scripts with Ctrl+C in each terminal, then:
 docker compose down
 ```
 
-`docker compose down` removes the container and its ephemeral storage, so the next
-`docker compose up -d` starts with a clean broker and an empty `fix-orders` topic.
+`docker compose down` removes all containers and their ephemeral storage. The next
+`docker compose up -d` starts with a clean broker, an empty `fix-orders` topic,
+and an empty Elasticsearch index.
